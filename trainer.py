@@ -18,10 +18,10 @@ class Options:
     # Dataset parameters
     train_root = 'dataset/'  # Path to training images
     train_annotations = 'dataset/annotations.json'
-    character = string.printable[:-6]  # Add all characters present in your dataset
+    character = string.printable[:-6] + ' '  # Added space character
     
     # Training parameters
-    saved_model = ''  # Path to pretrained model (if continuing training)
+    saved_model = './saved_models/TPS-ResNet-BiLSTM-Attn-case-sensitive.pth'  # Path to pretrained model (if continuing training)
     batch_size = 64
     workers = 4
     num_epochs = 100
@@ -30,7 +30,7 @@ class Options:
     save_dir = './saved_models/'
     validation_split = 0.1  # 10% for validation
     
-    # Model architecture (keep original TPS configuration)
+    # Model architecture
     Transformation = 'TPS'
     FeatureExtraction = 'ResNet'
     SequenceModeling = 'BiLSTM'
@@ -44,18 +44,18 @@ class Options:
     imgW = 100
     PAD = True
     rgb = False
-    sensitive = False  # Set to True if using case-sensitive
-    
+    sensitive = True  # Case-sensitive handling
+
     def __init__(self):
         if self.sensitive:
-            self.character = string.printable[:-6]
+            self.character = string.printable[:-6] + ' '
 
 opt = Options()
 
 class CustomDataset(Dataset):
     def __init__(self, annotations_path, img_root, opt):
         with open(annotations_path) as f:
-            self.annotations = [ann for ann in json.load(f) if ' ' not in ann['text']]  # Filter here
+            self.annotations = json.load(f)  # Removed space filter
         self.img_root = img_root
         self.opt = opt
         
@@ -69,24 +69,91 @@ class CustomDataset(Dataset):
         return image, annotation['text']
 
 def train(opt):
-    # Create save directory
     os.makedirs(opt.save_dir, exist_ok=True)
 
-    # Prepare converter
+    # Prepare converter with updated character set
     if 'CTC' in opt.Prediction:
         converter = CTCLabelConverter(opt.character)
     else:
         converter = AttnLabelConverter(opt.character)
     opt.num_class = len(converter.character)
 
-    # Create model
+    # Create model with new character count
     model = Model(opt)
     model = torch.nn.DataParallel(model).to(device)
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
 
-    # Load pretrained weights
+    # Handle pretrained weights with new space class
     if opt.saved_model:
-        model.load_state_dict(torch.load(opt.saved_model, map_location=device))
+        print(f'Loading pretrained weights from {opt.saved_model}')
+        pretrained = torch.load(opt.saved_model, map_location=device)
+        model_dict = model.state_dict()
+
+        # 1. Handle embedding layer expansion
+        embed_key = 'module.Prediction.embedding.weight'
+        if embed_key in pretrained:
+            old_embed_size, embed_dim = pretrained[embed_key].shape
+            new_embed_size = model_dict[embed_key].shape[0]
+            
+            if old_embed_size != new_embed_size:
+                print(f"Adjusting embedding layer from {old_embed_size} to {new_embed_size}")
+                model_dict[embed_key][:old_embed_size] = pretrained[embed_key]
+                pretrained[embed_key] = model_dict[embed_key]
+
+        # 2. Handle attention RNN layers
+        attention_layers = {
+            'weight_ih': (0, 1),  # (output_dim, input_dim)
+            'weight_hh': (0, 1),
+            'bias_ih': (0,),
+            'bias_hh': (0,)
+        }
+        
+        base_path = 'module.Prediction.attention_cell.rnn.'
+        for layer in ['weight_ih', 'weight_hh', 'bias_ih', 'bias_hh']:
+            key = base_path + layer
+            if key in pretrained:
+                old_tensor = pretrained[key]
+                new_tensor = model_dict[key]
+                
+                # Handle weight dimensions
+                if len(old_tensor.shape) == 2:
+                    min_dim0 = min(old_tensor.shape[0], new_tensor.shape[0])
+                    min_dim1 = min(old_tensor.shape[1], new_tensor.shape[1])
+                    new_tensor[:min_dim0, :min_dim1] = old_tensor[:min_dim0, :min_dim1]
+                # Handle bias dimensions
+                else:  
+                    min_dim0 = min(old_tensor.shape[0], new_tensor.shape[0])
+                    new_tensor[:min_dim0] = old_tensor[:min_dim0]
+                
+                pretrained[key] = new_tensor
+                print(f"Adjusted {key} dimensions")
+
+        # 3. Handle projection layer if exists
+        proj_key = 'module.Prediction.attention_cell.linear_proj.weight'
+        if proj_key in pretrained:
+            old_proj = pretrained[proj_key]
+            new_proj = model_dict[proj_key]
+            min_dim = min(old_proj.shape[1], new_proj.shape[1])
+            new_proj[:, :min_dim] = old_proj[:, :min_dim]
+            pretrained[proj_key] = new_proj
+            print("Adjusted projection layer")
+
+        # 4. Handle final generator layer
+        gen_weight_key = 'module.Prediction.generator.weight'
+        gen_bias_key = 'module.Prediction.generator.bias'
+        
+        if gen_weight_key in pretrained:
+            old_num_class = pretrained[gen_weight_key].size(0)
+            new_num_class = opt.num_class
+            
+            model_dict[gen_weight_key][:old_num_class] = pretrained[gen_weight_key]
+            model_dict[gen_bias_key][:old_num_class] = pretrained[gen_bias_key]
+            pretrained[gen_weight_key] = model_dict[gen_weight_key]
+            pretrained[gen_bias_key] = model_dict[gen_bias_key]
+
+        # 5. Load modified weights
+        model.load_state_dict(pretrained, strict=False)
+        print('Successfully loaded pretrained weights with full dimension adjustments')
 
     # Loss and optimizer
     if 'CTC' in opt.Prediction:
@@ -98,7 +165,6 @@ def train(opt):
     # Prepare datasets
     align_collate = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
     
-    # Load full dataset and split
     full_dataset = CustomDataset(opt.train_annotations, opt.train_root, opt)
     dataset_size = len(full_dataset)
     val_size = int(dataset_size * opt.validation_split)
@@ -107,7 +173,7 @@ def train(opt):
     train_dataset, val_dataset = random_split(
         full_dataset, 
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)  # For reproducibility
+        generator=torch.Generator().manual_seed(42)
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -125,6 +191,7 @@ def train(opt):
         pin_memory=True)
 
     # Training loop
+    print("starting training")
     best_accuracy = 0
     for epoch in range(opt.num_epochs):
         model.train()
@@ -132,13 +199,12 @@ def train(opt):
         
         for images, texts in train_loader:
             batch_size = images.size(0)
-            print("batch, ", batch_size)
+            print("batch", batch_size)
             images = images.to(device)
             
-            # Prepare text for loss
+            # Prepare text with space characters
             text_for_loss, length_for_loss = converter.encode(texts, batch_max_length=opt.batch_max_length)
             
-            # Forward pass
             if 'CTC' in opt.Prediction:
                 preds = model(images, text_for_loss)
                 preds_size = torch.IntTensor([preds.size(1)] * batch_size).to(device)
@@ -147,20 +213,19 @@ def train(opt):
                 preds = model(images, text_for_loss[:, :-1], is_train=True)
                 loss = criterion(preds.view(-1, preds.size(-1)), text_for_loss[:, 1:].contiguous().view(-1))
             
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
             optimizer.step()
             
             total_loss += loss.item()
+            print("loss: ", loss.item())
 
-        # Validation
+        # Validation with space support
         avg_loss = total_loss / len(train_loader)
         current_accuracy = validate(model, val_loader, converter, opt)
         print(f'Epoch [{epoch+1}/{opt.num_epochs}], Loss: {avg_loss:.4f}, Accuracy: {current_accuracy:.2f}%')
 
-        # Save model
         if (epoch+1) % opt.save_interval == 0:
             torch.save(model.state_dict(), f'{opt.save_dir}/epoch_{epoch+1}.pth')
         if current_accuracy > best_accuracy:
@@ -190,6 +255,7 @@ def validate(model, val_loader, converter, opt):
                 preds_str = converter.decode(preds_index, length_for_pred)
                 preds_str = [pred.split('[s]')[0] for pred in preds_str]
             
+            # Space-aware validation
             for pred, true_text in zip(preds_str, texts):
                 if pred == true_text:
                     correct += 1
